@@ -2,7 +2,7 @@
 # OpenWrt Control Center - installer
 #
 #   One-liner (on the router, as root):
-#     wget -qO- https://raw.githubusercontent.com/YOUR_GITHUB_USER/openwrt-control-center/main/install.sh | sh
+#     wget -qO- https://raw.githubusercontent.com/mrsurajmeena/openwrt-control-center/main/install.sh | sh
 #   or from a downloaded copy of this repository:
 #     sh install.sh
 #
@@ -10,7 +10,7 @@
 #   CC_MNT=/mnt/xyz   mount point of the USB drive/SD card used to store history
 #   CC_REPO=user/repo CC_BRANCH=main   where to download files from
 
-REPO="${CC_REPO:-YOUR_GITHUB_USER/openwrt-control-center}"
+REPO="${CC_REPO:-mrsurajmeena/openwrt-control-center}"
 BRANCH="${CC_BRANCH:-main}"
 BASE="https://raw.githubusercontent.com/$REPO/$BRANCH/files"
 D="${DESTDIR:-}"          # only used for testing the installer off-router
