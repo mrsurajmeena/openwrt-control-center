@@ -16,6 +16,10 @@ No Docker, no extra web server, no database. It uses what OpenWrt already has: L
 - Clock in your router's timezone and optional weather tile ([Open-Meteo](https://open-meteo.com), no API key)
 - A status pill that turns amber/red if the traffic sampler stalls or the drive is missing, so you know when numbers can't be trusted
 - Lightweight: one 5-minute cron job; history is written to external storage, never the router's flash
+<img width="1217" height="553" alt="image" src="https://github.com/user-attachments/assets/16445c0e-505d-46df-ab59-3fd29292305b" />
+<img width="1217" height="553" alt="image" src="https://github.com/user-attachments/assets/c776818b-1f74-4349-8c9c-7786542540a9" />
+
+
 
 ## Requirements
 
