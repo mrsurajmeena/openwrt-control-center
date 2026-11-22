@@ -1,0 +1,10 @@
+{
+	"luci-app-control-center": {
+		"description": "Grant access to the Control Center dashboard",
+		"read": {
+			"file": {
+				"/usr/bin/cc-api": [ "exec" ]
+			}
+		}
+	}
+}

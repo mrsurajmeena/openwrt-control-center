@@ -1,0 +1,100 @@
+#!/bin/sh
+# Control Center sampler - runs from cron every 5 minutes.
+# Reads cumulative per-MAC counters from nlbwmon, computes the increase since the
+# previous run, and appends it to a monthly CSV on the USB drive.
+#
+# CSV line:  epoch,YYYY-MM-DD,mac,download_bytes,upload_bytes   (dates in your router timezone)
+
+[ -f /etc/cc-dashboard.conf ] && . /etc/cc-dashboard.conf
+export TZ="${CC_TZ:-UTC0}"
+MNT="${CC_MNT:-/mnt/sda1}"
+DATA="$MNT/cc-data"
+LOCK="${CC_LOCK:-/tmp/cc-sampler.lock}"
+TMP="${CC_TMP:-/tmp}"
+SWAP="${CC_SWAP:-0}"   # 1 = Download/Upload reversed compared with LuCI > Services > Network Bandwidth Monitor
+
+fail() { echo "$1" > "$TMP/cc-status"; [ -d "$DATA" ] && echo "$1" > "$DATA/status"; exit 1; }
+
+# 1. USB must really be mounted (never write into the router's RAM disk by mistake)
+if [ -z "$CC_SKIP_MOUNT_CHECK" ]; then
+  grep -q " $MNT " /proc/mounts || fail "usb-not-mounted"
+fi
+mkdir -p "$DATA" || fail "cannot-create-data-dir"
+
+# 2. Lock so two runs never overlap (stale locks are detected via the PID)
+if ! mkdir "$LOCK" 2>/dev/null; then
+  OLD=$(cat "$LOCK/pid" 2>/dev/null)
+  if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null; then exit 0; fi
+  rm -rf "$LOCK"; mkdir "$LOCK" || exit 1
+fi
+echo $$ > "$LOCK/pid"
+trap 'rm -rf "$LOCK"' EXIT
+
+NOW=$(date +%s)
+DAY=$(date +%Y-%m-%d)
+MONTH=$(date +%Y-%m)
+CSV="$DATA/usage-$MONTH.csv"
+STATE="$DATA/state.csv"
+
+# 3. Read nlbwmon (grouped by MAC => IPv4 and IPv6 are already merged per device)
+RAW=$(nlbw -c json -g mac 2>/dev/null)
+[ -n "$RAW" ] || fail "nlbw-failed"
+
+IDX=$(jsonfilter -s "$RAW" -e '@.columns[*]' | awk '$0=="mac"{m=NR} $0=="rx_bytes"{r=NR} $0=="tx_bytes"{t=NR} END{print m, r, t}')
+set -- $IDX
+[ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ] || fail "nlbw-columns-missing"
+MI=$1; RI=$2; TI=$3
+
+# json-c prints arrays like  [ "aa:bb:..", 5, 1000 ]  -> strip brackets, quotes AND spaces
+jsonfilter -s "$RAW" -e '@.data[*]' | tr -d '[]" \t\r' > "$TMP/cc-now.csv"
+
+# 4. State file (previous cumulative counters). Header line keeps awk's two-file logic safe.
+[ -f "$STATE" ] || echo "x,0,0" > "$STATE"
+FIRST=1
+[ "$(grep -vc '^x,' "$STATE")" -gt 0 ] && FIRST=0
+[ -f "$DATA/started" ] || echo "$DAY" > "$DATA/started"
+
+# 5. Delta calculation
+SUMS=$(awk -F, -v mi="$MI" -v ri="$RI" -v ti="$TI" -v now="$NOW" -v day="$DAY" \
+    -v swap="$SWAP" -v first="$FIRST" -v csvout="$CSV" -v stateout="$STATE.new" '
+  FNR==NR { k=$1; gsub(/[ \t\r]/,"",k); lr[k]=$2+0; lt[k]=$3+0; next }
+  NF >= 3 {
+    mac = $mi; gsub(/[ \t\r]/,"",mac); mac = tolower(mac); rx = $ri + 0; tx = $ti + 0
+    if (swap == 1) { t = rx; rx = tx; tx = t }
+    cr[mac] += rx; ct[mac] += tx
+  }
+  END {
+    print "x,0,0" > stateout
+    for (m in cr) {
+      dr = 0; dt = 0
+      if (!first) {
+        if (m in lr) {
+          dr = cr[m] - lr[m]; dt = ct[m] - lt[m]
+          # counter went backwards (nlbwmon period rollover / reboot): re-baseline, do not guess
+          if (dr < 0 || dt < 0) { dr = 0; dt = 0 }
+        } else {
+          # device first seen in this period: everything it has is new traffic
+          dr = cr[m]; dt = ct[m]
+        }
+      }
+      if (dr > 0 || dt > 0) { printf "%s,%s,%s,%.0f,%.0f\n", now, day, m, dr, dt >> csvout; SR += dr; ST += dt }
+      printf "%s,%.0f,%.0f\n", m, cr[m], ct[m] > stateout
+    }
+    printf "%.0f %.0f\n", SR, ST
+  }' "$STATE" "$TMP/cc-now.csv") || fail "awk-failed"
+
+mv "$STATE.new" "$STATE"
+
+# 6. Lifetime counter (since tracking began). Built once from existing CSVs, then incremented.
+LIFE="$DATA/lifetime"
+if [ ! -f "$LIFE" ]; then
+  cat "$DATA"/usage-*.csv 2>/dev/null | awk -F, '{r+=$4;t+=$5} END{printf "%.0f %.0f\n", r+0, t+0}' > "$LIFE"
+else
+  echo "$(cat "$LIFE") $SUMS" | awk '{printf "%.0f %.0f\n", $1+$3, $2+$4}' > "$LIFE.new" && mv "$LIFE.new" "$LIFE"
+fi
+CCAPI="${CC_API:-/usr/bin/cc-api}"
+[ -x "$CCAPI" ] && "$CCAPI" learn >/dev/null 2>&1
+echo "$NOW" > "$DATA/last-run"
+echo "ok" > "$DATA/status"
+rm -f "$TMP/cc-status"
+exit 0

@@ -1,0 +1,158 @@
+#!/bin/sh
+# Control Center backend. Prints JSON.  Usage: cc-api live | usage | info
+[ -f /etc/cc-dashboard.conf ] && . /etc/cc-dashboard.conf
+export TZ="${CC_TZ:-UTC0}"
+MNT="${CC_MNT:-/mnt/sda1}"
+DATA="$MNT/cc-data"
+TMP="${CC_TMP:-/tmp}"
+NAMES="${CC_NAMES:-/etc/cc-names.conf}"
+
+num() { [ -n "$1" ] && echo "$1" || echo 0; }
+
+live() {
+  CPU=$(head -n1 /proc/stat | awk '{print $2","$3","$4","$5","$6","$7","$8","$9}')
+  MEM=$(awk '
+    /^MemTotal:/{t=$2} /^MemAvailable:/{a=$2} /^MemFree:/{f=$2} /^Cached:/{c=$2}
+    /^SwapTotal:/{st=$2} /^SwapFree:/{sf=$2}
+    END{if(a=="")a=f; printf "\"mem_total\":%d,\"mem_avail\":%d,\"mem_cached\":%d,\"swap_total\":%d,\"swap_free\":%d", t,a,c,st,sf}' /proc/meminfo)
+  LOAD=$(cut -d' ' -f1-3 /proc/loadavg | tr ' ' ',')
+  UP=$(cut -d' ' -f1 /proc/uptime)
+
+  WAN=$(ifstatus wan 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+  [ -n "$WAN" ] || WAN=$(uci -q get network.wan.device)
+  [ -n "$WAN" ] || WAN=eth0
+  RX=$(cat "/sys/class/net/$WAN/statistics/rx_bytes" 2>/dev/null)
+  TX=$(cat "/sys/class/net/$WAN/statistics/tx_bytes" 2>/dev/null)
+
+  MOUNTED=0
+  grep -q " $MNT " /proc/mounts && MOUNTED=1
+  DF=$(df -k "$MNT" 2>/dev/null | tail -n1 | awk '{print $2","$3","$4}')
+  [ "$MOUNTED" = 1 ] || DF="0,0,0"
+  [ -n "$DF" ] || DF="0,0,0"
+
+  LAST=$(cat "$DATA/last-run" 2>/dev/null)
+  STATUS=$(cat "$DATA/status" 2>/dev/null)
+  [ -n "$STATUS" ] || STATUS=$(cat "$TMP/cc-status" 2>/dev/null)
+  [ -n "$STATUS" ] || STATUS="never-run"
+  LEASES=$(cat /tmp/dhcp.leases 2>/dev/null | wc -l)
+
+  printf '{"now":%s,"up":%s,"cpu":[%s],%s,"load":[%s],"wan_dev":"%s","wan_rx":%s,"wan_tx":%s,' \
+    "$(date +%s)" "$UP" "$CPU" "$MEM" "$LOAD" "$WAN" "$(num $RX)" "$(num $TX)"
+  printf '"usb_mounted":%s,"usb":[%s],"sampler_last":%s,"sampler_status":"%s","leases":%s}\n' \
+    "$MOUNTED" "$DF" "$(num $LAST)" "$STATUS" "$(num $LEASES)"
+}
+
+info() {
+  MODEL=$(ubus call system board 2>/dev/null | jsonfilter -e '@.model' | tr -d '"\\')
+  REL=$(ubus call system board 2>/dev/null | jsonfilter -e '@.release.description' | tr -d '"\\')
+  KERN=$(uname -r)
+  PL=$(echo "$CC_PLACE" | tr -d '"\\')
+  printf '{"model":"%s","release":"%s","kernel":"%s","tz":"%s","lat":"%s","lon":"%s","place":"%s"}\n' \
+    "$MODEL" "$REL" "$KERN" "$CC_TZ_NAME" "$CC_LAT" "$CC_LON" "$PL"
+}
+
+build_names() {
+  LAN=$(uci -q get network.lan.device); [ -n "$LAN" ] || LAN=br-lan
+  {
+    echo "header,,"
+    # learned earlier (lowest priority): keeps names after a lease has expired
+    [ -f "$DATA/known.csv" ] && cat "$DATA/known.csv"
+    # IP by MAC from the LAN neighbour table only (never the WAN side)
+    ip -4 neigh show dev "$LAN" 2>/dev/null | awk '$4=="lladdr"{print tolower($5)",,"$1}'
+    # DHCP leases: expiry mac ip hostname clientid
+    [ -f /tmp/dhcp.leases ] && awk '{h=$4; if(h=="*")h=""; gsub(/[",\\]/,"",h); print tolower($2)","h","$3}' /tmp/dhcp.leases
+    # static DHCP hosts from /etc/config/dhcp (every MAC listed, not just the first)
+    uci -q show dhcp | awk -F= -v q="'" '
+      { split($1,a,"."); s=a[2]; o=a[3]; v=$2; gsub(q,"",v);
+        if(o=="mac") mac[s]=tolower(v)
+        else if(o=="name") nm[s]=v
+        else if(o=="ip") ip[s]=v }
+      END{for(s in mac){ gsub(/[",\\]/,"",nm[s]); n=split(mac[s],mm," "); for(i=1;i<=n;i++) print mm[i]","nm[s]","ip[s] }}'
+    # your own names: /etc/cc-names.conf  ->  aa:bb:cc:dd:ee:ff Friendly Name
+    [ -f "$NAMES" ] && awk '!/^#/ && NF>=2 {m=tolower($1); $1=""; sub(/^ +/,""); gsub(/[",\\]/,""); print m","$0","}' "$NAMES"
+  } > "$TMP/cc-names.raw"
+  # later lines override earlier ones, but never with an empty value
+  awk -F, '$1!="" && $1!="header" { if($2!="")n[$1]=$2; if($3!="")p[$1]=$3; seen[$1]=1 }
+           END{print "header,,"; for(m in seen) print m","n[m]","p[m]}' "$TMP/cc-names.raw" > "$TMP/cc-names.csv"
+}
+
+# Remember name/IP of every device we can see right now, so it is still named after it leaves
+learn() {
+  mkdir -p "$DATA" 2>/dev/null || return 1
+  build_names
+  awk -F, '$1!="header"' "$TMP/cc-names.csv" | awk -F, '$2!="" || $3!=""' > "$TMP/cc-learn.new"
+  { [ -f "$DATA/known.csv" ] && cat "$DATA/known.csv"; cat "$TMP/cc-learn.new"; } | \
+    awk -F, '$1!="" { if($2!="")n[$1]=$2; if($3!="")p[$1]=$3; seen[$1]=1 } END{for(m in seen) print m","n[m]","p[m]}' > "$DATA/known.csv.new" \
+    && mv "$DATA/known.csv.new" "$DATA/known.csv"
+}
+
+debug() {
+  echo "== MACs nlbwmon is counting (mac, rx, tx) =="
+  nlbw -c json -g mac 2>/dev/null | jsonfilter -e '@.data[*]' | tr -d '[]"'
+  echo "== DHCP leases =="; cat /tmp/dhcp.leases 2>/dev/null
+  echo "== LAN neighbours =="; ip -4 neigh show 2>/dev/null
+  echo "== Static hosts =="; uci -q show dhcp | grep -E '\.(mac|name|ip)='
+  echo "== Learned (known.csv) =="; cat "$DATA/known.csv" 2>/dev/null
+}
+
+usage() {
+  TODAY=$(date +%Y-%m-%d)
+  MONTH=$(date +%Y-%m)
+  CUR="$DATA/usage-$MONTH.csv"
+  CACHE="$TMP/cc-usage-$TODAY.json"
+
+  if [ -f "$CACHE" ] && [ ! "$CUR" -nt "$CACHE" ] && [ -z "$(find "$CACHE" -mmin +4 2>/dev/null)" ]; then
+    cat "$CACHE"; return
+  fi
+  rm -f "$TMP"/cc-usage-*.json
+
+  build_names
+  NOW=$(date +%s)
+  DAYS=""
+  i=13
+  while [ $i -ge 0 ]; do
+    DAYS="$DAYS $(date -d "@$((NOW - i*86400))" +%Y-%m-%d)"
+    i=$((i-1))
+  done
+  FILES=$(ls -1 "$DATA"/usage-*.csv 2>/dev/null | tail -n 2)
+  [ -n "$FILES" ] || { : > "$TMP/cc-empty.csv"; FILES="$TMP/cc-empty.csv"; }
+  STARTED=$(cat "$DATA/started" 2>/dev/null)
+  set -- $(cat "$DATA/lifetime" 2>/dev/null); LR=$(num $1); LT=$(num $2)
+
+  # shellcheck disable=SC2086
+  awk -F, -v today="$TODAY" -v month="$MONTH" -v days="$DAYS" -v started="$STARTED" -v lr="$LR" -v lt="$LT" '
+    FILENAME ~ /cc-names.csv$/ { if($1!="header"){ nm[$1]=$2; ip[$1]=$3; all[$1]=1 } next }
+    {
+      d=$2; mac=$3; gsub(/[ \t\r]/,"",mac); r=$4+0; t=$5+0
+      all[mac]=1
+      hr[d]+=r; ht[d]+=t
+      if (d==today) { dr[mac]+=r; dt[mac]+=t; DR+=r; DT+=t }
+      if (substr(d,1,7)==month) { mr[mac]+=r; mt[mac]+=t; MR+=r; MT+=t }
+    }
+    END {
+      printf "{\"started\":\"%s\",\"life\":{\"rx\":%.0f,\"tx\":%.0f},\"today\":{\"rx\":%.0f,\"tx\":%.0f},\"month\":{\"rx\":%.0f,\"tx\":%.0f},\"devices\":[", started, lr, lt, DR, DT, MR, MT
+      n=0
+      for (k in all) {
+        name = nm[k]
+        if (k=="00:00:00:00:00:00") name = "Router / unattributed"
+        else if (name=="" && ip[k]!="") name = "Device · " ip[k]
+        else if (name=="") name = "Unknown device · " toupper(substr(k,13))
+        kn = (name !~ /^Unknown device/ && k!="00:00:00:00:00:00") ? 1 : 0
+        printf "%s{\"mac\":\"%s\",\"name\":\"%s\",\"ip\":\"%s\",\"known\":%d,\"drx\":%.0f,\"dtx\":%.0f,\"mrx\":%.0f,\"mtx\":%.0f}", (n++?",":""), k, name, ip[k], kn, dr[k], dt[k], mr[k], mt[k]
+      }
+      printf "],\"days\":["
+      nd = split(days, da, " ")
+      for (i=1;i<=nd;i++) printf "%s{\"d\":\"%s\",\"rx\":%.0f,\"tx\":%.0f}", (i>1?",":""), da[i], hr[da[i]], ht[da[i]]
+      printf "]}\n"
+    }' "$TMP/cc-names.csv" $FILES > "$CACHE.new" && mv "$CACHE.new" "$CACHE"
+  cat "$CACHE"
+}
+
+case "$1" in
+  live)  live ;;
+  usage) usage ;;
+  info)  info ;;
+  learn) learn ;;
+  debug) debug ;;
+  *) echo '{"error":"usage: cc-api live|usage|info"}' ;;
+esac

@@ -1,0 +1,13 @@
+{
+	"admin/status/control-center": {
+		"title": "Control Center",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "control-center/main"
+		},
+		"depends": {
+			"acl": [ "luci-app-control-center" ]
+		}
+	}
+}
