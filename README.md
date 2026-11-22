@@ -34,7 +34,7 @@ Developed and tested on a JioRouter AX6000 (MediaTek Filogic) running OpenWrt 25
 3. SSH into the router and run:
 
    ```sh
-   wget -qO- https://raw.githubusercontent.com/YOUR_GITHUB_USER/openwrt-control-center/main/install.sh | sh
+   wget -qO- https://raw.githubusercontent.com/mrsurajmeena/openwrt-control-center/main/install.sh | sh
    ```
 
    If your router can't download over HTTPS, download this repository as a ZIP on your computer, copy the folder to the router (`scp -O -r openwrt-control-center root@192.168.1.1:/tmp/`) and run `sh /tmp/openwrt-control-center/install.sh`.
